@@ -41,10 +41,15 @@ By building three separate microservices:
                      | Discovery  : tools/list          |
                      | Execution  : tools/call          |
                      | Tracing    : X-Request-ID        |
-                     | Exposed Semantic Tools:          |
+                     |                                  |
+                     | Exposed Semantic Tools (5):      |
+                     |  [Atomic Tools]                  |
                      |   - inspect_resume               |
                      |   - analyze_job                  |
                      |   - compare_skills               |
+                     |  [Composite Capabilities]        |
+                     |   - generate_candidate_report    |
+                     |   - create_candidate_shortlist   |
                      +----------------+-----------------+
                                       |
                                       | Internal HTTP REST (HTTPX)
@@ -187,93 +192,172 @@ Each backend service exposes a simple health probe returning HTTP 200:
 
 ---
 
-## 13. Phase 2 — MCP Gateway
+## 13. Phase 2 — Atomic MCP Capabilities
 
-### What MCP Does Here
-The **Model Context Protocol (MCP)** provides an open, standardized bridge between AI clients (LLMs, agents, developer tools) and data sources/tools. Instead of building custom REST integrations for every tool or forcing an LLM to manage multiple HTTP URLs and authentication handshakes, the AI interacts with a single MCP server.
-
-### Difference Between REST API and MCP Tool
-
-| Aspect | Backend REST Endpoint (e.g., `POST /inspect`) | MCP Tool (e.g., `inspect_resume`) |
-|---|---|---|
-| **Target Consumer** | Software applications / microservices | AI models, LLM agents, MCP Clients |
-| **Protocol** | HTTP / REST / JSON | JSON-RPC 2.0 over Streamable HTTP or Stdio |
-| **Schema Discovery** | OpenAPI (`/docs`, `/openapi.json`) | MCP Protocol `tools/list` handshake |
-| **Payload Envelope** | Transport envelope (`success`, `data`, `error`) | Direct semantic data (`candidate_name`, `skills`) |
-| **Error Handling** | HTTP status codes (400, 422, 500) | MCP Protocol error objects (`is_error=True`) |
-
-### How the MCP Gateway Routes Calls
-1. The MCP client sends a `tools/call` JSON-RPC message targeting `inspect_resume`.
-2. The MCP Gateway validates the input arguments according to the schema.
-3. The Gateway generates an application-level correlation ID (e.g., `mcp-req-f6ee04ef`).
-4. The Gateway invokes `call_backend()` via `httpx.AsyncClient` targeting `http://localhost:8001/inspect`, passing `X-Request-ID: mcp-req-f6ee04ef`.
-5. The Resume Service processes the text deterministically and responds with `{ "success": true, "data": {...} }`.
-6. The Gateway unwraps the `data` payload and delivers it directly to the MCP client as the tool execution result.
-
-### Currently Exposed MCP Tools
+Atomic capabilities correspond 1-to-1 with a backend domain capability:
 
 1. **`inspect_resume`**
    - **Description:** Inspect and parse raw candidate resume text into structured candidate profile data.
    - **Arguments:** `resume_text: str` (required)
-   - **Returns:** `{ "candidate_name": str, "skills": list[str], "experience_years": int, "education": str }`
+   - **Routes to:** Resume Service (`POST /inspect`)
 
 2. **`analyze_job`**
    - **Description:** Analyze job description text and extract title, required skills, and experience requirements.
    - **Arguments:** `job_description: str` (required)
-   - **Returns:** `{ "title": str, "required_skills": list[str], "experience_required": int }`
+   - **Routes to:** Job Service (`POST /analyze`)
 
 3. **`compare_skills`**
    - **Description:** Compare candidate skills against job required skills and calculate match percentage.
    - **Arguments:** `candidate_skills: list[str]`, `required_skills: list[str]` (required)
-   - **Returns:** `{ "matched": list[str], "missing": list[str], "match_percentage": float }`
+   - **Routes to:** Matching Service (`POST /compare`)
 
 ---
 
-## 14. Testing the MCP Gateway
+## 14. Phase 3 — Composite MCP Capabilities
 
-An automated verification script is provided using the official MCP Python Client:
+In real enterprise systems, an AI agent often needs high-level business answers rather than performing multiple micro-steps manually. **Composite MCP Capabilities** orchestrate multiple lower-level microservices inside the gateway and return a single, rich, unified result.
+
+```text
+             MCP CLIENT
+                 |
+                 v
+          MCP GATEWAY :8000
+                 |
+      +----------+----------+
+      |          |          |
+      v          v          v
+   Resume      Job       Matching
+   :8001       :8002       :8003
+```
+
+### Atomic vs. Composite Capabilities
+
+```text
+[Atomic Capability]
+inspect_resume ──────────> Resume Service (:8001)
+
+[Composite Capability 1: generate_candidate_report]
+generate_candidate_report ──┬──> Resume Service (:8001/inspect)
+                            ├──> Job Service (:8002/analyze)
+                            └──> Matching Service (:8003/compare)
+                            ───> Combined Unified Assessment
+
+[Composite Capability 2: create_candidate_shortlist]
+create_candidate_shortlist ─┬──> Job Service (:8002/analyze)
+                            ├──> Loop Resumes (Resume :8001/inspect)
+                            ├──> Loop Matches (Matching :8003/compare)
+                            └──> Deterministic Ranked Shortlist
+```
+
+### Critical Architecture Rule: Direct Internal Orchestration
+The MCP Gateway **does NOT recursively call itself through MCP**. Calling tools through JSON-RPC loops over network ports creates latency and protocol overhead. Instead, composite tools orchestrate private async helper functions (`_call_resume_service`, `_call_job_service`, `_call_matching_service`) that talk directly to backend REST APIs.
+
+### The Two Composite Tools
+
+4. **`generate_candidate_report`**
+   - **Description:** Generate a comprehensive candidate evaluation report by orchestrating resume inspection, job analysis, and skill comparison.
+   - **Inputs:** `resume_text: str`, `job_description: str`
+   - **Returns:**
+     ```json
+     {
+       "candidate": {
+         "name": "Alex Johnson",
+         "skills": ["Python", "SQL", "FastAPI", "Docker"],
+         "experience_years": 4,
+         "education": "B.Tech"
+       },
+       "job": {
+         "title": "Backend Software Engineer",
+         "required_skills": ["Python", "SQL", "REST API"],
+         "experience_required": 3
+       },
+       "skill_match": {
+         "matched": ["Python", "SQL"],
+         "missing": ["REST API"],
+         "match_percentage": 66.67
+       },
+       "overall_assessment": "Good technical match with some skill gaps. Experience requirement met (4 years vs 3 required)."
+     }
+     ```
+
+5. **`create_candidate_shortlist`**
+   - **Description:** Evaluate multiple candidate resumes against a job description and generate a ranked candidate shortlist.
+   - **Inputs:** `job_description: str`, `resumes: list[str]`
+   - **Ranking Algorithm:**
+     - **Primary:** `match_percentage` (descending)
+     - **Secondary (Tie-breaker):** `experience_years` (descending)
+     - Sequential ranks assigned starting at 1.
+   - **Returns:**
+     ```json
+     {
+       "job": {
+         "title": "Backend Software Engineer",
+         "required_skills": ["Python", "SQL", "REST API"],
+         "experience_required": 3
+       },
+       "candidates": [
+         {
+           "rank": 1,
+           "name": "Candidate Gamma",
+           "match_percentage": 100.0,
+           "matched_skills": ["Python", "SQL", "REST API"],
+           "missing_skills": [],
+           "experience_years": 6
+         },
+         {
+           "rank": 2,
+           "name": "Candidate Alpha",
+           "match_percentage": 66.67,
+           "matched_skills": ["Python", "SQL"],
+           "missing_skills": ["REST API"],
+           "experience_years": 5
+         }
+       ],
+       "total_candidates": 2
+     }
+     ```
+
+---
+
+## 15. Single Correlation ID Tracing for Composite Workflows
+
+When a composite capability is executed, the gateway generates **one correlation ID** representing the entire business transaction. Every backend call made across all microservices carries this exact same `X-Request-ID`:
+
+```text
+MCP Client (tools/call: generate_candidate_report)
+    │
+    ▼
+MCP Gateway: generates [mcp-req-report-c66a69f3]
+             logs: [mcp-req-report-c66a69f3] tool=generate_candidate_report started
+    │
+    ├── [mcp-req-report-c66a69f3] POST :8001/inspect ──> Resume Service logs: [mcp-req-report-c66a69f3] POST /inspect 200
+    ├── [mcp-req-report-c66a69f3] POST :8002/analyze ──> Job Service logs   : [mcp-req-report-c66a69f3] POST /analyze 200
+    └── [mcp-req-report-c66a69f3] POST :8003/compare ──> Matching Service logs: [mcp-req-report-c66a69f3] POST /compare 200
+    │
+    ▼
+MCP Gateway: logs: [mcp-req-report-c66a69f3] tool=generate_candidate_report completed
+    │
+    ▼
+MCP Client receives unified composite report
+```
+
+---
+
+## 16. Comprehensive Verification Suite
+
+Run the full end-to-end automated test suite:
 
 ```powershell
 .\.venv\Scripts\python.exe test_mcp_gateway.py
 ```
 
-This test script validates:
-1. Connection to the Streamable HTTP transport at `http://127.0.0.1:8000/mcp`.
-2. Protocol handshake and `tools/list` discovery for all 3 tools.
-3. Automatic schema derivation from function type annotations.
-4. Live tool execution (`tools/call`) across all 3 tools.
-5. Verification of unwrapped semantic results.
-6. Error translation on invalid input (clean error message without stack trace leakage).
+This suite validates:
+1. **Tool Discovery:** Exactly 5 tools exposed with valid JSON schemas.
+2. **Atomic Tools:** `inspect_resume`, `analyze_job`, `compare_skills`.
+3. **Composite Report:** Full orchestration across 3 services.
+4. **Candidate Shortlist:** Multi-candidate evaluation with Candidate C ranked #1 (100% match, 6 yrs).
+5. **Tie-Breaking:** Equal match percentage broken by higher experience years.
+6. **Input Validation:** Clean `[INVALID_INPUT]` semantic errors without stack trace leakage.
+7. **Correlation ID Consistency:** Verified via console logs.
 
 > **MCP Inspector Note:** MCP Inspector was not executed via `npx` because Node.js/npx is not installed on this machine. MCP protocol compliance, tool discovery, and routing behavior are fully verified using the official Python MCP client.
-
----
-
-## 15. How Request IDs & Tracing Work
-
-The gateway separates:
-- **MCP Protocol Identity:** Internal JSON-RPC request IDs handled by the MCP SDK.
-- **Application Correlation ID:** Application-level tracing IDs formatted as `mcp-req-<uuid>`.
-
-Tracing flow:
-```text
-MCP Client (tools/call: inspect_resume)
-    |
-    v
-MCP Gateway: generates [mcp-req-f6ee04ef]
-             logs: [mcp-req-f6ee04ef] tool=inspect_resume started
-             logs: [mcp-req-f6ee04ef] calling resume-service
-    |
-    | HTTP POST /inspect
-    | Header: X-Request-ID: mcp-req-f6ee04ef
-    v
-Resume Service :8001
-             logs: [mcp-req-f6ee04ef] POST /inspect
-             logs: [mcp-req-f6ee04ef] completed 200
-    |
-    v
-MCP Gateway: logs: [mcp-req-f6ee04ef] tool=inspect_resume completed
-    |
-    v
-MCP Client: receives structured candidate data
-```
