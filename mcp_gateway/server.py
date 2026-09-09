@@ -1,297 +1,549 @@
-"""Talent Intelligence MCP Gateway Server using MCP Python SDK v2.
+"""
+Talent Intelligence MCP Gateway Server.
 
-Exposes 5 semantic tools:
-- Atomic: inspect_resume, analyze_job, compare_skills
-- Composite: generate_candidate_report, create_candidate_shortlist
+Exposes six semantic MCP tools:
+1. inspect_resume
+2. analyze_job
+3. compare_skills
+4. generate_candidate_report
+5. create_candidate_shortlist
+6. get_github_profile
+
+The gateway handles:
+- MCP protocol
+- authentication
+- authorization
+- correlation/request IDs
+- backend routing
+- composite capability orchestration
+- GitHub integration
+
+Business logic remains inside backend services.
 """
 
-import logging
-import uuid
-from typing import Any, Dict, List
-import uvicorn
-from mcp.server import MCPServer
+from typing import Any
+
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+
 from mcp_gateway.client import GatewayBackendError, call_backend
 from mcp_gateway.config import (
-    GATEWAY_HOST,
-    GATEWAY_PORT,
     JOB_SERVICE_URL,
     MATCHING_SERVICE_URL,
     RESUME_SERVICE_URL,
 )
+from mcp_gateway.github_client import (
+    GitHubClientError,
+    get_user,
+    get_user_repositories,
+)
+from mcp_gateway.security import authorize
 
-logger = logging.getLogger("mcp_gateway")
 
-# Initialize MCP Server v2
-mcp_server = MCPServer("Talent Intelligence MCP Gateway")
+server = MCPServer("talent-intelligence-gateway")
 
 
-# ==============================================================================
-# Internal Private Orchestration Helpers (Not exposed as MCP tools)
-# ==============================================================================
+def _get_api_key(ctx: Context) -> str | None:
+    """Read the demo API key from the incoming HTTP headers."""
+    headers = ctx.headers or {}
+    return headers.get("x-api-key") or headers.get("X-API-Key")
 
-async def _call_resume_service(resume_text: str, req_id: str) -> Dict[str, Any]:
-    """Call internal Resume Service directly using the provided correlation ID."""
-    print(f"[{req_id}] calling resume-service", flush=True)
+
+def _get_request_id(ctx: Context) -> str:
+    """Use MCP request ID as correlation ID when available."""
+    request_id = getattr(ctx, "request_id", None)
+
+    if request_id:
+        return str(request_id)
+
+    return "mcp-request"
+
+
+def _handle_backend_error(exc: GatewayBackendError) -> None:
+    """Convert backend errors into MCP ToolError responses."""
+    raise ToolError(f"[{exc.code}] {exc.message}")
+
+
+async def _call_resume_service(
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
     try:
         return await call_backend(
-            service_url=RESUME_SERVICE_URL,
-            path="/inspect",
-            payload={"resume_text": resume_text},
-            request_id=req_id
+            RESUME_SERVICE_URL,
+            "/inspect",
+            payload,
+            request_id,
         )
     except GatewayBackendError as exc:
-        raise ToolError(f"[{exc.code}] {exc.message}") from None
-    except Exception as exc:
-        raise ToolError(f"[INTERNAL_ERROR] Resume service failed: {str(exc)}") from None
+        _handle_backend_error(exc)
+
+    raise RuntimeError("Unreachable")
 
 
-async def _call_job_service(job_description: str, req_id: str) -> Dict[str, Any]:
-    """Call internal Job Service directly using the provided correlation ID."""
-    print(f"[{req_id}] calling job-service", flush=True)
+async def _call_job_service(
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
     try:
         return await call_backend(
-            service_url=JOB_SERVICE_URL,
-            path="/analyze",
-            payload={"job_description": job_description},
-            request_id=req_id
+            JOB_SERVICE_URL,
+            "/analyze",
+            payload,
+            request_id,
         )
     except GatewayBackendError as exc:
-        raise ToolError(f"[{exc.code}] {exc.message}") from None
-    except Exception as exc:
-        raise ToolError(f"[INTERNAL_ERROR] Job service failed: {str(exc)}") from None
+        _handle_backend_error(exc)
+
+    raise RuntimeError("Unreachable")
 
 
 async def _call_matching_service(
-    candidate_skills: List[str],
-    required_skills: List[str],
-    req_id: str
-) -> Dict[str, Any]:
-    """Call internal Matching Service directly using the provided correlation ID."""
-    print(f"[{req_id}] calling matching-service", flush=True)
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
     try:
         return await call_backend(
-            service_url=MATCHING_SERVICE_URL,
-            path="/compare",
-            payload={
-                "candidate_skills": candidate_skills,
-                "required_skills": required_skills
-            },
-            request_id=req_id
+            MATCHING_SERVICE_URL,
+            "/compare",
+            payload,
+            request_id,
         )
     except GatewayBackendError as exc:
-        raise ToolError(f"[{exc.code}] {exc.message}") from None
-    except Exception as exc:
-        raise ToolError(f"[INTERNAL_ERROR] Matching service failed: {str(exc)}") from None
+        _handle_backend_error(exc)
+
+    raise RuntimeError("Unreachable")
 
 
-# ==============================================================================
-# Atomic MCP Tools (Tools 1, 2, 3)
-# ==============================================================================
-
-@mcp_server.tool(
-    name="inspect_resume",
-    description="Inspect and parse raw candidate resume text into structured candidate profile data."
-)
-async def inspect_resume(resume_text: str) -> Dict[str, Any]:
-    """Inspect raw resume text and extract candidate profile, skills, and experience."""
-    if not resume_text or not resume_text.strip():
-        raise ToolError("[INVALID_INPUT] resume_text must not be empty")
-
-    req_id = f"mcp-req-{uuid.uuid4().hex[:8]}"
-    print(f"[{req_id}] tool=inspect_resume started", flush=True)
-    try:
-        data = await _call_resume_service(resume_text, req_id)
-        print(f"[{req_id}] tool=inspect_resume completed", flush=True)
-        return data
-    except ToolError as exc:
-        print(f"[{req_id}] tool=inspect_resume failed: {str(exc)}", flush=True)
-        raise
-
-
-@mcp_server.tool(
-    name="analyze_job",
-    description="Analyze job description text and extract title, required skills, and experience requirements."
-)
-async def analyze_job(job_description: str) -> Dict[str, Any]:
-    """Analyze a job description and extract title, required skills, and experience."""
-    if not job_description or not job_description.strip():
-        raise ToolError("[INVALID_INPUT] job_description must not be empty")
-
-    req_id = f"mcp-req-{uuid.uuid4().hex[:8]}"
-    print(f"[{req_id}] tool=analyze_job started", flush=True)
-    try:
-        data = await _call_job_service(job_description, req_id)
-        print(f"[{req_id}] tool=analyze_job completed", flush=True)
-        return data
-    except ToolError as exc:
-        print(f"[{req_id}] tool=analyze_job failed: {str(exc)}", flush=True)
-        raise
-
-
-@mcp_server.tool(
-    name="compare_skills",
-    description="Compare candidate skills against job required skills and calculate match percentage."
-)
-async def compare_skills(
-    candidate_skills: List[str],
-    required_skills: List[str]
-) -> Dict[str, Any]:
-    """Compare candidate skills against required skills and return matched, missing, and match percentage."""
-    req_id = f"mcp-req-{uuid.uuid4().hex[:8]}"
-    print(f"[{req_id}] tool=compare_skills started", flush=True)
-    try:
-        data = await _call_matching_service(candidate_skills, required_skills, req_id)
-        print(f"[{req_id}] tool=compare_skills completed", flush=True)
-        return data
-    except ToolError as exc:
-        print(f"[{req_id}] tool=compare_skills failed: {str(exc)}", flush=True)
-        raise
-
-
-# ==============================================================================
-# Composite MCP Tools (Tools 4, 5)
-# ==============================================================================
-
-@mcp_server.tool(
-    name="generate_candidate_report",
-    description="Generate a comprehensive candidate evaluation report by orchestrating resume inspection, job analysis, and skill comparison."
-)
-async def generate_candidate_report(
+@server.tool()
+async def inspect_resume(
     resume_text: str,
-    job_description: str
-) -> Dict[str, Any]:
-    """Orchestrate resume inspection, job analysis, and skill matching to produce a unified candidate report."""
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Inspect a resume and extract structured candidate information.
+
+    Returns:
+    - candidate name
+    - email
+    - phone
+    - skills
+    - experience years
+    - education
+    - raw text length
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "inspect_resume")
+
     if not resume_text or not resume_text.strip():
-        raise ToolError("[INVALID_INPUT] resume_text must not be empty")
-    if not job_description or not job_description.strip():
-        raise ToolError("[INVALID_INPUT] job_description must not be empty")
-
-    req_id = f"mcp-req-report-{uuid.uuid4().hex[:8]}"
-    print(f"[{req_id}] tool=generate_candidate_report started", flush=True)
-
-    try:
-        # 1. Inspect resume
-        raw_cand = await _call_resume_service(resume_text, req_id)
-
-        # 2. Analyze job
-        job_data = await _call_job_service(job_description, req_id)
-
-        # 3. Compare skills
-        cand_skills = raw_cand.get("skills", [])
-        req_skills = job_data.get("required_skills", [])
-        match_data = await _call_matching_service(cand_skills, req_skills, req_id)
-
-        # 4. Deterministic assessment calculation
-        match_pct = match_data.get("match_percentage", 0.0)
-        cand_exp = raw_cand.get("experience_years", 0)
-        req_exp = job_data.get("experience_required", 0)
-
-        if match_pct >= 80.0:
-            match_summary = "Strong technical match."
-        elif match_pct >= 60.0:
-            match_summary = "Good technical match with some skill gaps."
-        else:
-            match_summary = "Significant skill gaps identified."
-
-        if cand_exp >= req_exp:
-            exp_summary = f"Experience requirement met ({cand_exp} years vs {req_exp} required)."
-        else:
-            exp_summary = f"Experience gap identified ({cand_exp} years vs {req_exp} required)."
-
-        overall_assessment = f"{match_summary} {exp_summary}"
-
-        # Normalize candidate dictionary with "name" key per contract
-        candidate_data = {
-            "name": raw_cand.get("candidate_name") or raw_cand.get("name") or "Alex Johnson",
-            "skills": raw_cand.get("skills", []),
-            "experience_years": cand_exp,
-            "education": raw_cand.get("education", "")
-        }
-
-        print(f"[{req_id}] tool=generate_candidate_report completed", flush=True)
-
-        return {
-            "candidate": candidate_data,
-            "job": job_data,
-            "skill_match": match_data,
-            "overall_assessment": overall_assessment
-        }
-    except ToolError as exc:
-        print(f"[{req_id}] tool=generate_candidate_report failed: {str(exc)}", flush=True)
-        raise
-
-
-@mcp_server.tool(
-    name="create_candidate_shortlist",
-    description="Evaluate multiple candidate resumes against a job description and generate a ranked candidate shortlist."
-)
-async def create_candidate_shortlist(
-    job_description: str,
-    resumes: List[str]
-) -> Dict[str, Any]:
-    """Orchestrate job analysis and sequential candidate resume evaluation to produce a ranked shortlist."""
-    if not job_description or not job_description.strip():
-        raise ToolError("[INVALID_INPUT] job_description must not be empty")
-    if not resumes:
-        raise ToolError("[INVALID_INPUT] resumes must contain at least one resume")
-    for idx, r in enumerate(resumes):
-        if not r or not r.strip():
-            raise ToolError(f"[INVALID_INPUT] resume text at index {idx} cannot be empty")
-
-    req_id = f"mcp-req-shortlist-{uuid.uuid4().hex[:8]}"
-    print(f"[{req_id}] tool=create_candidate_shortlist started (candidates={len(resumes)})", flush=True)
-
-    try:
-        # 1. Analyze job description once
-        job_data = await _call_job_service(job_description, req_id)
-        req_skills = job_data.get("required_skills", [])
-
-        evaluated_candidates: List[Dict[str, Any]] = []
-
-        # 2. Sequentially process each resume
-        for resume_text in resumes:
-            cand_profile = await _call_resume_service(resume_text, req_id)
-            match_result = await _call_matching_service(
-                cand_profile.get("skills", []),
-                req_skills,
-                req_id
-            )
-
-            evaluated_candidates.append({
-                "name": cand_profile.get("candidate_name", "Unknown Candidate"),
-                "match_percentage": match_result.get("match_percentage", 0.0),
-                "matched_skills": match_result.get("matched", []),
-                "missing_skills": match_result.get("missing", []),
-                "experience_years": cand_profile.get("experience_years", 0)
-            })
-
-        # 3. Deterministic ranking: Primary = match_percentage DESC, Secondary = experience_years DESC
-        evaluated_candidates.sort(
-            key=lambda c: (c["match_percentage"], c["experience_years"]),
-            reverse=True
+        raise ToolError(
+            "[INVALID_INPUT] resume_text cannot be empty"
         )
 
-        # 4. Assign ranks starting at 1
-        for rank_idx, candidate in enumerate(evaluated_candidates, start=1):
-            candidate["rank"] = rank_idx
+    request_id = _get_request_id(ctx)
 
-        print(f"[{req_id}] tool=create_candidate_shortlist completed", flush=True)
+    return await _call_resume_service(
+        {
+            "resume_text": resume_text,
+        },
+        request_id,
+    )
+
+
+@server.tool()
+async def analyze_job(
+    job_description: str,
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Analyze a job description and extract structured requirements.
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "analyze_job")
+
+    if not job_description or not job_description.strip():
+        raise ToolError(
+            "[INVALID_INPUT] job_description cannot be empty"
+        )
+
+    request_id = _get_request_id(ctx)
+
+    return await _call_job_service(
+        {
+            "job_description": job_description,
+        },
+        request_id,
+    )
+
+
+@server.tool()
+async def compare_skills(
+    candidate_skills: list[str],
+    required_skills: list[str],
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Compare candidate skills against required job skills.
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "compare_skills")
+
+    if not candidate_skills:
+        raise ToolError(
+            "[INVALID_INPUT] candidate_skills cannot be empty"
+        )
+
+    if not required_skills:
+        raise ToolError(
+            "[INVALID_INPUT] required_skills cannot be empty"
+        )
+
+    request_id = _get_request_id(ctx)
+
+    return await _call_matching_service(
+        {
+            "candidate_skills": candidate_skills,
+            "required_skills": required_skills,
+        },
+        request_id,
+    )
+
+
+@server.tool()
+async def generate_candidate_report(
+    resume_text: str,
+    job_description: str,
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Generate a candidate-job match report.
+
+    This is a composite MCP capability:
+    1. inspect resume
+    2. analyze job
+    3. compare skills
+    4. generate a deterministic assessment
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "generate_candidate_report")
+
+    if not resume_text or not resume_text.strip():
+        raise ToolError(
+            "[INVALID_INPUT] resume_text cannot be empty"
+        )
+
+    if not job_description or not job_description.strip():
+        raise ToolError(
+            "[INVALID_INPUT] job_description cannot be empty"
+        )
+
+    request_id = _get_request_id(ctx)
+
+    candidate = await _call_resume_service(
+        {
+            "resume_text": resume_text,
+        },
+        request_id,
+    )
+
+    job = await _call_job_service(
+        {
+            "job_description": job_description,
+        },
+        request_id,
+    )
+
+    candidate_skills = candidate.get("skills") or []
+    required_skills = job.get("required_skills") or []
+
+    if not required_skills:
+        raise ToolError(
+            "[INVALID_INPUT] Job contains no required skills"
+        )
+
+    match = await _call_matching_service(
+        {
+            "candidate_skills": candidate_skills,
+            "required_skills": required_skills,
+        },
+        request_id,
+    )
+
+    candidate_experience = candidate.get("experience_years")
+    required_experience = job.get("experience_required")
+
+    if (
+        candidate_experience is not None
+        and required_experience is not None
+    ):
+        experience_met = (
+            candidate_experience >= required_experience
+        )
+    else:
+        experience_met = None
+
+    match_percentage = match.get(
+        "match_percentage",
+        0,
+    )
+
+    if experience_met is True and match_percentage >= 80:
+        assessment = (
+            "Strong technical match. "
+            "Experience requirement met."
+        )
+    elif match_percentage >= 60:
+        assessment = (
+            "Good technical match with some skill gaps."
+        )
+    else:
+        assessment = (
+            "Limited technical match. "
+            "Several required skills are missing."
+        )
+
+    return {
+        "candidate": {
+            "name": candidate.get("candidate_name"),
+            "email": candidate.get("email"),
+            "phone": candidate.get("phone"),
+            "experience_years": candidate_experience,
+            "skills": candidate_skills,
+        },
+        "job": {
+            "title": job.get("title"),
+            "required_skills": required_skills,
+            "experience_required": required_experience,
+        },
+        "skill_match": match,
+        "experience": {
+            "candidate_years": candidate_experience,
+            "required_years": required_experience,
+            "requirement_met": experience_met,
+        },
+        "overall_assessment": assessment,
+        "correlation_id": request_id,
+    }
+
+
+@server.tool()
+async def create_candidate_shortlist(
+    job_description: str,
+    resumes: list[str],
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Create a ranked candidate shortlist.
+
+    Candidates are ranked deterministically by:
+    1. Higher skill match percentage
+    2. Higher experience when skill match is tied
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "create_candidate_shortlist")
+
+    if not job_description or not job_description.strip():
+        raise ToolError(
+            "[INVALID_INPUT] job_description cannot be empty"
+        )
+
+    if not resumes:
+        raise ToolError(
+            "[INVALID_INPUT] resumes cannot be empty"
+        )
+
+    request_id = _get_request_id(ctx)
+
+    job = await _call_job_service(
+        {
+            "job_description": job_description,
+        },
+        request_id,
+    )
+
+    required_skills = job.get("required_skills") or []
+
+    if not required_skills:
+        raise ToolError(
+            "[INVALID_INPUT] Job contains no required skills"
+        )
+
+    ranked_candidates: list[dict[str, Any]] = []
+
+    for resume_text in resumes:
+        if not resume_text or not str(resume_text).strip():
+            raise ToolError(
+                "[INVALID_INPUT] Every resume must contain text"
+            )
+
+        candidate_profile = await _call_resume_service(
+            {
+                "resume_text": resume_text,
+            },
+            request_id,
+        )
+
+        candidate_skills = candidate_profile.get("skills") or []
+
+        match = await _call_matching_service(
+            {
+                "candidate_skills": candidate_skills,
+                "required_skills": required_skills,
+            },
+            request_id,
+        )
+
+        experience = candidate_profile.get(
+            "experience_years"
+        )
+
+        sort_experience = (
+            experience if experience is not None else 0
+        )
+
+        ranked_candidates.append(
+            {
+                "name": candidate_profile.get(
+                    "candidate_name"
+                ),
+                "email": candidate_profile.get(
+                    "email"
+                ),
+                "match_percentage": match.get(
+                    "match_percentage",
+                    0,
+                ),
+                "matched_skills": match.get(
+                    "matched_skills",
+                    [],
+                ),
+                "missing_skills": match.get(
+                    "missing_skills",
+                    [],
+                ),
+                "experience_years": experience,
+                "_sort_experience": sort_experience,
+            }
+        )
+
+    ranked_candidates.sort(
+        key=lambda candidate: (
+            -float(
+                candidate.get(
+                    "match_percentage",
+                    0,
+                )
+            ),
+            -int(
+                candidate.get(
+                    "_sort_experience",
+                    0,
+                )
+            ),
+        )
+    )
+
+    for rank, candidate in enumerate(
+        ranked_candidates,
+        start=1,
+    ):
+        candidate["rank"] = rank
+        candidate.pop("_sort_experience", None)
+
+    return {
+        "job": {
+            "title": job.get("title"),
+            "required_skills": required_skills,
+            "experience_required": job.get(
+                "experience_required"
+            ),
+        },
+        "total_candidates": len(ranked_candidates),
+        "candidates": ranked_candidates,
+        "correlation_id": request_id,
+    }
+
+
+@server.tool()
+async def get_github_profile(
+    username: str,
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Fetch GitHub profile and public repository intelligence
+    for a candidate.
+    """
+
+    api_key = _get_api_key(ctx)
+    authorize(api_key, "get_github_profile")
+
+    if not username or not username.strip():
+        raise ToolError(
+            "[INVALID_INPUT] GitHub username cannot be empty"
+        )
+
+    request_id = _get_request_id(ctx)
+
+    try:
+        user = await get_user(username)
+        repositories = await get_user_repositories(username)
+
+        repo_data: list[dict[str, Any]] = []
+
+        for repo in repositories:
+            repo_data.append(
+                {
+                    "name": repo.get("name"),
+                    "description": repo.get("description"),
+                    "language": repo.get("language"),
+                    "html_url": repo.get("html_url"),
+                    "topics": repo.get("topics", []),
+                    "stars": repo.get(
+                        "stargazers_count",
+                        0,
+                    ),
+                    "forks": repo.get(
+                        "forks_count",
+                        0,
+                    ),
+                }
+            )
 
         return {
-            "job": job_data,
-            "candidates": evaluated_candidates,
-            "total_candidates": len(evaluated_candidates)
+            "username": user.get("login"),
+            "name": user.get("name"),
+            "bio": user.get("bio"),
+            "public_repositories": user.get(
+                "public_repos",
+                0,
+            ),
+            "followers": user.get(
+                "followers",
+                0,
+            ),
+            "following": user.get(
+                "following",
+                0,
+            ),
+            "profile_url": user.get("html_url"),
+            "repositories": repo_data,
+            "correlation_id": request_id,
         }
-    except ToolError as exc:
-        print(f"[{req_id}] tool=create_candidate_shortlist failed: {str(exc)}", flush=True)
-        raise
 
-
-# Starlette ASGI application for Streamable HTTP
-app = mcp_server.streamable_http_app(streamable_http_path="/mcp")
+    except GitHubClientError as exc:
+        raise ToolError(
+            f"[{exc.code}] {exc.message}"
+        )
 
 
 if __name__ == "__main__":
-    print(f"Starting Talent Intelligence MCP Gateway on http://{GATEWAY_HOST}:{GATEWAY_PORT}/mcp ...", flush=True)
-    uvicorn.run("mcp_gateway.server:app", host=GATEWAY_HOST, port=GATEWAY_PORT, reload=False)
+    server.run(
+        transport="streamable-http",
+        host="127.0.0.1",
+        port=8000,
+    )
