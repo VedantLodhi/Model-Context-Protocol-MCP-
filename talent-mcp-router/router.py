@@ -1,8 +1,8 @@
 from typing import Any
 
-import asyncio
+import httpx
 from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -11,73 +11,65 @@ server = MCPServer("talent-intelligence-mcp")
 
 
 MCP_SERVERS = {
-    "resume": r".\resume-mcp\resume_server.py",
-    "job": r".\job-mcp\job_server.py",
-    "matching": r".\matching-mcp\matching_server.py",
+    "resume": "http://127.0.0.1:8111/mcp",
+    "job": "http://127.0.0.1:8112/mcp",
+    "matching": "http://127.0.0.1:8113/mcp",
 }
 
 
-class TalentMCPRouter:
-    def __init__(self):
-        self.sessions: dict[str, ClientSession] = {}
-        self.contexts: dict[str, Any] = {}
-
-    async def connect(self):
-        for name, server_file in MCP_SERVERS.items():
-            server_params = StdioServerParameters(
-                command=r".\.venv\Scripts\python.exe",
-                args=[server_file],
-            )
-
-            context = stdio_client(server_params)
-
-            read_stream, write_stream = await context.__aenter__()
-
-            client = ClientSession(
-                read_stream,
-                write_stream,
-            )
-
-            await client.__aenter__()
-            await client.initialize()
-
-            self.contexts[name] = (context, client)
-            self.sessions[name] = client
-
-    async def disconnect(self):
-        for context, client in self.contexts.values():
-            await client.__aexit__(None, None, None)
-            await context.__aexit__(None, None, None)
-
-        self.contexts.clear()
-        self.sessions.clear()
-
-    async def call_tool(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ):
-        if tool_name == "inspect_resume":
-            session = self.sessions["resume"]
-
-        elif tool_name == "analyze_job":
-            session = self.sessions["job"]
-
-        elif tool_name == "compare_skills":
-            session = self.sessions["matching"]
-
-        else:
-            raise ToolError(
-                f"[UNKNOWN_TOOL] Unknown tool: {tool_name}"
-            )
-
-        return await session.call_tool(
-            tool_name,
-            arguments,
+async def call_child_mcp(
+    mcp_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+):
+    if mcp_name not in MCP_SERVERS:
+        raise ToolError(
+            f"[UNKNOWN_MCP] Unknown MCP server: {mcp_name}"
         )
 
+    server_url = MCP_SERVERS[mcp_name]
 
-router = TalentMCPRouter()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+
+            async with streamable_http_client(
+                server_url,
+                http_client=http_client,
+            ) as (read_stream, write_stream):
+
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                ) as client:
+
+                    await client.initialize()
+
+                    result = await client.call_tool(
+                        tool_name,
+                        arguments,
+                    )
+
+                    if result.is_error:
+                        raise ToolError(
+                            f"[{mcp_name.upper()}_MCP_ERROR] "
+                            f"{tool_name} returned an error."
+                        )
+
+                    return result.structured_content
+
+    except ToolError:
+        raise
+
+    except httpx.RequestError as exc:
+        raise ToolError(
+            f"[{mcp_name.upper()}_MCP_UNAVAILABLE] "
+            f"Unable to reach {mcp_name} MCP: {exc}"
+        )
+
+    except Exception as exc:
+        raise ToolError(
+            f"[ROUTER_ERROR] Failed to call {mcp_name} MCP: {exc}"
+        )
 
 
 @server.tool()
@@ -93,25 +85,13 @@ async def inspect_resume(
             "[INVALID_INPUT] resume_text cannot be empty"
         )
 
-    await router.connect()
-
-    try:
-        result = await router.call_tool(
-            "inspect_resume",
-            {
-                "resume_text": resume_text.strip(),
-            },
-        )
-
-        if result.is_error:
-            raise ToolError(
-                "[RESUME_MCP_ERROR] Resume MCP returned an error."
-            )
-
-        return result.structured_content
-
-    finally:
-        await router.disconnect()
+    return await call_child_mcp(
+        "resume",
+        "inspect_resume",
+        {
+            "resume_text": resume_text.strip(),
+        },
+    )
 
 
 @server.tool()
@@ -127,25 +107,13 @@ async def analyze_job(
             "[INVALID_INPUT] job_description cannot be empty"
         )
 
-    await router.connect()
-
-    try:
-        result = await router.call_tool(
-            "analyze_job",
-            {
-                "job_description": job_description.strip(),
-            },
-        )
-
-        if result.is_error:
-            raise ToolError(
-                "[JOB_MCP_ERROR] Job MCP returned an error."
-            )
-
-        return result.structured_content
-
-    finally:
-        await router.disconnect()
+    return await call_child_mcp(
+        "job",
+        "analyze_job",
+        {
+            "job_description": job_description.strip(),
+        },
+    )
 
 
 @server.tool()
@@ -167,26 +135,14 @@ async def compare_skills(
             "[INVALID_INPUT] required_skills cannot be empty"
         )
 
-    await router.connect()
-
-    try:
-        result = await router.call_tool(
-            "compare_skills",
-            {
-                "candidate_skills": candidate_skills,
-                "required_skills": required_skills,
-            },
-        )
-
-        if result.is_error:
-            raise ToolError(
-                "[MATCHING_MCP_ERROR] Matching MCP returned an error."
-            )
-
-        return result.structured_content
-
-    finally:
-        await router.disconnect()
+    return await call_child_mcp(
+        "matching",
+        "compare_skills",
+        {
+            "candidate_skills": candidate_skills,
+            "required_skills": required_skills,
+        },
+    )
 
 
 if __name__ == "__main__":
