@@ -76,3 +76,23 @@ class MCPConnection:
             tool_name,
             arguments,
         )
+
+class MCPClient:
+    """
+    High-level MCP client/orchestration entry point.
+
+    AtlasHost calls this component. It delegates every computational
+    request to the WorkflowEngine. The WorkflowEngine then uses the
+    MCPRouter, which owns the low-level MCPConnection objects.
+
+    Call chain:
+        AtlasHost -> MCPClient -> WorkflowEngine -> MCPRouter
+        -> MCPConnection -> MCP Server
+    """
+
+    def __init__(self, workflow_engine):
+        self.workflow_engine = workflow_engine
+
+    async def execute(self, query: str):
+        """Execute a user query through the workflow/orchestration layer."""
+        return await self.workflow_engine.execute(query)

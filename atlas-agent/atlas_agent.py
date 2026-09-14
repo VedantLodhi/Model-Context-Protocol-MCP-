@@ -56,7 +56,25 @@ async def main() -> None:
         print("Type 'exit' to stop.")
 
         while True:
-            query = input("\nYou: ").strip()
+            print("\nYou: ", end="", flush=True)
+
+            lines = []
+
+            while True:
+                line = input()
+
+                # Blank line = submit multiline query
+                if not line.strip():
+                    break
+
+                lines.append(line)
+
+            query = "\n".join(lines).strip()
+
+            # Ignore empty input
+            if not query:
+                print("\nAtlas: Please enter a query.")
+                continue
 
             # Exit Atlas
             if query.lower() == "exit":

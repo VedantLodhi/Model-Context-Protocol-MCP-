@@ -14,6 +14,10 @@ class ToolCapability:
 
 
 CAPABILITIES = [
+    # ---------------------------------------------------------
+    # Algebra MCP
+    # ---------------------------------------------------------
+
     ToolCapability(
         server="algebra",
         tool_name="solve_algebra",
@@ -23,6 +27,11 @@ CAPABILITIES = [
             "algebraic expressions."
         ),
     ),
+
+    # ---------------------------------------------------------
+    # DateTime / Unit MCP
+    # ---------------------------------------------------------
+
     ToolCapability(
         server="datetime_unit",
         tool_name="convert_units",
@@ -32,6 +41,7 @@ CAPABILITIES = [
             "to another unit."
         ),
     ),
+
     ToolCapability(
         server="datetime_unit",
         tool_name="date_time",
@@ -39,6 +49,40 @@ CAPABILITIES = [
         description=(
             "Get the current time for a requested "
             "timezone."
+        ),
+    ),
+
+    # ---------------------------------------------------------
+    # Talent Intelligence MCP
+    # ---------------------------------------------------------
+
+    ToolCapability(
+        server="talent",
+        tool_name="inspect_resume",
+        intent="talent_resume",
+        description=(
+            "Inspect a resume and extract structured "
+            "candidate information."
+        ),
+    ),
+
+    ToolCapability(
+        server="talent",
+        tool_name="analyze_job",
+        intent="talent_job",
+        description=(
+            "Analyze a job description and extract "
+            "structured job requirements."
+        ),
+    ),
+
+    ToolCapability(
+        server="talent",
+        tool_name="compare_skills",
+        intent="talent_matching",
+        description=(
+            "Compare candidate skills against "
+            "required job skills."
         ),
     ),
 ]

@@ -1,6 +1,4 @@
-from mcp_client.client import MCPClient
 from mcp_client.router import MCPRouter
-from workflow.engine import WorkflowEngine
 
 from .memory import AtlasMemory
 from .models import ExecutionRecord
@@ -13,13 +11,14 @@ class AtlasHost:
     Responsibilities:
     - Receive user queries
     - Resolve follow-up queries using conversation context
-    - Send computational queries to the MCP Client
+    - Send new computational queries to the MCP Router
     - Maintain conversation memory
     - Maintain structured execution history
     - Format MCP results for the user
 
     AtlasHost does NOT:
     - Connect directly to MCP servers
+    - Detect MCP intent for new requests
     - Select MCP tools
     - Perform algebra/unit/date calculations
     """
@@ -27,8 +26,6 @@ class AtlasHost:
     def __init__(self, router: MCPRouter):
         self.router = router
         self.memory = AtlasMemory()
-        self.workflow_engine = WorkflowEngine(router)
-        self.mcp_client = MCPClient(self.workflow_engine)
 
     async def handle_query(self, query: str) -> str:
         """
@@ -40,6 +37,8 @@ class AtlasHost:
         if not query:
             return "Please enter a query."
 
+        is_follow_up = self._is_follow_up(query)
+
         # ---------------------------------------------------------
         # Follow-up request
         # ---------------------------------------------------------
@@ -47,8 +46,6 @@ class AtlasHost:
         # Follow-ups are handled directly by Atlas using memory.
         # They do NOT trigger another MCP call.
         #
-        is_follow_up = self._is_follow_up(query)
-
         if is_follow_up:
             response = self._answer_follow_up(query)
 
@@ -72,20 +69,11 @@ class AtlasHost:
                 return response
 
         # ---------------------------------------------------------
-        # Computational request
+        # New request
         # ---------------------------------------------------------
-        #
-        # All new computational requests now follow the required
-        # architecture:
-        #
-        # Atlas Host
-        #   -> MCP Client
-        #   -> Workflow Engine
-        #   -> MCP Router
-        #   -> MCP Server
-        #
+
         try:
-            execution_result = await self.mcp_client.execute(query)
+            route_result = await self.router.route(query)
 
         except Exception as exc:
             response = (
@@ -111,58 +99,9 @@ class AtlasHost:
 
             return response
 
-        # Workflow Engine returns a WorkflowResult for multi-step
-        # workflows and a RouteResult for single-step MCP requests.
-        if hasattr(execution_result, "workflow_name"):
-            workflow_result = execution_result
-
-            if workflow_result.status != "success":
-                response = (
-                    "Workflow failed. "
-                    f"Reason: {workflow_result.error}"
-                )
-
-                self.memory.add_execution(
-                    ExecutionRecord(
-                        query=query,
-                        intent="workflow",
-                        tool_name="Workflow Engine",
-                        result=workflow_result,
-                        status="error",
-                        follow_up=False,
-                    )
-                )
-
-                self.memory.add_turn(
-                    query,
-                    response,
-                )
-
-                return response
-
-            response = self._format_workflow_result(
-                workflow_result
-            )
-
-            self.memory.add_execution(
-                ExecutionRecord(
-                    query=query,
-                    intent="workflow",
-                    tool_name="Workflow Engine",
-                    result=workflow_result,
-                    status="success",
-                    follow_up=False,
-                )
-            )
-
-            self.memory.add_turn(
-                query,
-                response,
-            )
-
-            return response
-
-        route_result = execution_result
+        # ---------------------------------------------------------
+        # Router returned an error
+        # ---------------------------------------------------------
 
         if route_result.error:
             response = route_result.error
@@ -185,10 +124,15 @@ class AtlasHost:
 
             return response
 
+        # ---------------------------------------------------------
+        # Successful MCP result
+        # ---------------------------------------------------------
+
         response = self._format_result(
             route_result
         )
 
+        # Store the result as the active context.
         self.memory.set_result(
             route_result.intent,
             route_result.data,
@@ -218,7 +162,7 @@ class AtlasHost:
         self.memory.show_history()
 
     def show_execution_history(self) -> None:
-        """Display structured MCP/workflow execution history."""
+        """Display structured MCP execution history."""
 
         self.memory.show_execution_history()
 
@@ -271,8 +215,7 @@ class AtlasHost:
 
         try:
             content = (
-                self.memory.last_algebra_result
-                .structured_content
+                self.memory.last_algebra_result.structured_content
             )
 
             solutions = content["solution"]
@@ -345,28 +288,6 @@ class AtlasHost:
             return str(int(value))
 
         return str(value)
-
-    @staticmethod
-    def _format_workflow_result(workflow_result) -> str:
-        content = workflow_result.output
-
-        if workflow_result.workflow_name == "talent_candidate_evaluation":
-            return (
-                "Candidate evaluation completed:\n"
-                f"Candidate: {content['candidate_name']}\n"
-                f"Job: {content['job_title']}\n"
-                f"Matched skills: {', '.join(content['matched_skills']) or 'None'}\n"
-                f"Missing skills: {', '.join(content['missing_skills']) or 'None'}\n"
-                f"Match percentage: {content['match_percentage']}%"
-            )
-
-        return (
-            "Workflow completed:\n"
-            f"{content['value']} "
-            f"{content['from_unit']} = "
-            f"{content['result']} "
-            f"{content['result_unit']}"
-        )
 
     @staticmethod
     def _format_result(route_result) -> str:
