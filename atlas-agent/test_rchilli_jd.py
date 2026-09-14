@@ -40,7 +40,7 @@ async def get_access_token() -> str:
 
 async def main():
     print("=" * 70)
-    print("RCHILLI PARSE RESUME TEST")
+    print("RCHILLI PARSE JOB DESCRIPTION TEST")
     print("=" * 70)
 
     token = await get_access_token()
@@ -49,20 +49,22 @@ async def main():
         "Authorization": f"Bearer {token}",
     }
 
-    resume_text = """
-    Vedant Lodhi
+    job_description = """
+    Senior Python Developer
 
-    Python Developer
+    We are looking for a Senior Python Developer with strong
+    backend development experience.
 
-    Skills:
-    Python, FastAPI, SQL, Docker
+    Required Skills:
+    Python
+    FastAPI
+    SQL
+    Docker
+    Kubernetes
+    AWS
 
-    Experience:
-    2 years of experience developing backend applications
-    using Python and FastAPI.
-
-    Education:
-    Bachelor of Technology
+    Minimum Experience:
+    5 years
     """
 
     async with httpx.AsyncClient(
@@ -83,21 +85,23 @@ async def main():
                 await session.initialize()
 
                 print("\nCalling RChilli tool:")
-                print("parse_resume")
+                print("parse_job_description")
 
                 result = await session.call_tool(
-                    "parse_resume",
+                    "parse_job_description",
                     {
-                        "resume_text": resume_text,
+                        "jd_text": job_description,
                     },
                 )
 
                 print("\n" + "=" * 70)
-                print("RCHILLI RESPONSE")
+                print("RCHILLI JD RESPONSE")
                 print("=" * 70)
 
                 print("\nIs Error:", result.is_error)
+
                 print("\nStructured Content:")
+
                 print(
                     json.dumps(
                         result.structured_content,

@@ -26,3 +26,5 @@ Thumbs.db
 
 # Local runtime database
 atlas-agent/atlas_memory.db
+
+atlas-agent/.env

@@ -1,6 +1,10 @@
 import asyncio
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import httpx
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
